@@ -26,7 +26,7 @@ import { normalizeMissingScoreId } from '../lib/score-fetcher.js'
 import { resolveAutostartExecPath, resolveAutostartNodePath } from '../lib/autostart.js'
 import { exportConfigToken, getApiKey, getApiKeyPool, getMaxTurns, getPinningMode, getProviderBaseUrl, getProviderModelId, getProviderPingIntervalMs, hasMultipleKeys, importConfigToken, normalizeConfigShape } from '../lib/config.js'
 import { buildNpmInstallInvocation, buildWindowsPostUpdateRestartCommand, getForcedUpdateVersion, getLocalUpdateTarballPath, getLocalUpdateVersion, isRunningFromSource, shouldStopAutostartBeforeUpdate } from '../lib/update.js'
-import { buildOpencodeHeaders, buildOpencodeProjectId, buildProviderRequestHeaders, extractOllamaModelRecords, getAccountStatus, getPinnedModelCandidate, getPinnedModelMatches, isProviderAuthOptional, isProviderBearerAuthEnabled, providerWantsBearerAuth, shouldRetryOptionalProviderWithBearer, toOllamaModelMeta, toOpenCodeModelMeta, toOpenRouterModelMeta, toKiloCodeModelMeta } from '../lib/server.js'
+import { buildKiroRequestPayload, buildKiroSocialLoginUrl, buildOpencodeHeaders, buildOpencodeProjectId, buildProviderRequestBody, buildProviderRequestHeaders, exchangeKiroSocialCode, extractKiroEmailFromAccessToken, extractOllamaModelRecords, getAccountStatus, getKiroRefreshToken, hasKiroAuthConfigured, getPinnedModelCandidate, getPinnedModelMatches, isProviderAuthOptional, isProviderBearerAuthEnabled, parseKiroEventFrame, pollKiroBuilderIdToken, providerWantsBearerAuth, resolveKiroOAuthAccessToken, shouldRetryOptionalProviderWithBearer, startKiroBuilderIdDeviceAuth, toOllamaModelMeta, toOpenCodeModelMeta, toOpenRouterModelMeta, toKiloCodeModelMeta, transformKiroResponse } from '../lib/server.js'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(__dirname, '..')
 
@@ -61,6 +61,55 @@ function withEnv(overrides, fn) {
       else process.env[key] = value
     }
   }
+}
+
+const TEST_CRC32_TABLE = new Uint32Array(256)
+for (let i = 0; i < 256; i++) {
+  let c = i
+  for (let j = 0; j < 8; j++) {
+    c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
+  }
+  TEST_CRC32_TABLE[i] = c >>> 0
+}
+
+function crc32(buf) {
+  let crc = 0xffffffff
+  for (let i = 0; i < buf.length; i++) {
+    crc = TEST_CRC32_TABLE[(crc ^ buf[i]) & 0xff] ^ (crc >>> 8)
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+
+function encodeKiroEventFrame(eventType, payload) {
+  const encoder = new TextEncoder()
+  const nameBytes = encoder.encode(':event-type')
+  const valueBytes = encoder.encode(eventType)
+  const headersLength = 1 + nameBytes.length + 1 + 2 + valueBytes.length
+  const payloadBytes = encoder.encode(payload == null ? '' : JSON.stringify(payload))
+  const totalLength = 12 + headersLength + payloadBytes.length + 4
+  const frame = new Uint8Array(totalLength)
+  const view = new DataView(frame.buffer)
+
+  view.setUint32(0, totalLength, false)
+  view.setUint32(4, headersLength, false)
+  view.setUint32(8, crc32(frame.slice(0, 8)), false)
+
+  let offset = 12
+  frame[offset] = nameBytes.length
+  offset += 1
+  frame.set(nameBytes, offset)
+  offset += nameBytes.length
+  frame[offset] = 7
+  offset += 1
+  frame[offset] = (valueBytes.length >> 8) & 0xff
+  frame[offset + 1] = valueBytes.length & 0xff
+  offset += 2
+  frame.set(valueBytes, offset)
+  offset += valueBytes.length
+  frame.set(payloadBytes, offset)
+
+  view.setUint32(totalLength - 4, crc32(frame.slice(0, totalLength - 4)), false)
+  return frame
 }
 
 describe('config helpers', () => {
@@ -134,6 +183,12 @@ describe('sources data integrity', () => {
     assert.ok(sources.opencode)
     assert.equal(sources.opencode.name, 'OpenCode Zen')
     assert.ok(Array.isArray(sources.opencode.models))
+  })
+
+  it('includes Kiro provider', () => {
+    assert.ok(sources.kiro)
+    assert.equal(sources.kiro.name, 'Kiro')
+    assert.ok(Array.isArray(sources.kiro.models))
   })
 
   it('has expected provider structure', () => {
@@ -327,6 +382,276 @@ describe('provider api key resolution', () => {
     }
   })
 
+  it('resolves Kiro OAuth refresh token from env and config', () => {
+    const original = process.env.KIRO_REFRESH_TOKEN
+
+    try {
+      delete process.env.KIRO_REFRESH_TOKEN
+      assert.equal(getKiroRefreshToken({ providers: {} }), null)
+      assert.equal(getKiroRefreshToken({ providers: { kiro: { refreshToken: 'config-refresh-token' } } }), 'config-refresh-token')
+
+      process.env.KIRO_REFRESH_TOKEN = 'env-refresh-token'
+      assert.equal(getKiroRefreshToken({ providers: { kiro: { refreshToken: 'config-refresh-token' } } }), 'env-refresh-token')
+    } finally {
+      if (original === undefined) delete process.env.KIRO_REFRESH_TOKEN
+      else process.env.KIRO_REFRESH_TOKEN = original
+    }
+  })
+
+  it('reports Kiro auth configured when OAuth refresh token is present', () => {
+    assert.equal(hasKiroAuthConfigured({ providers: {} }), false)
+    assert.equal(hasKiroAuthConfigured({ providers: { kiro: { refreshToken: 'rtok' } } }), true)
+  })
+
+  it('refreshes Kiro OAuth access tokens from the Kiro refresh endpoint', async () => {
+    const originalRefreshToken = process.env.KIRO_REFRESH_TOKEN
+    const originalClientId = process.env.KIRO_OAUTH_CLIENT_ID
+    const originalClientSecret = process.env.KIRO_OAUTH_CLIENT_SECRET
+    const originalFetch = globalThis.fetch
+    const refreshToken = 'aorAAAAAG-test-refresh-token'
+
+    process.env.KIRO_REFRESH_TOKEN = refreshToken
+    delete process.env.KIRO_OAUTH_CLIENT_ID
+    delete process.env.KIRO_OAUTH_CLIENT_SECRET
+
+    let callCount = 0
+    globalThis.fetch = async (url, init) => {
+      callCount += 1
+      assert.equal(String(url), 'https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken')
+      assert.equal(init?.method, 'POST')
+      assert.equal(init?.headers?.['Content-Type'], 'application/json')
+      const body = JSON.parse(String(init?.body || '{}'))
+      assert.equal(body.refreshToken, refreshToken)
+      return new Response(JSON.stringify({
+        accessToken: 'oauth-access-token',
+        refreshToken,
+        expiresIn: 3600,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+
+    try {
+      const tokenA = await resolveKiroOAuthAccessToken({ providers: {} })
+      const tokenB = await resolveKiroOAuthAccessToken({ providers: {} })
+      assert.equal(tokenA, 'oauth-access-token')
+      assert.equal(tokenB, 'oauth-access-token')
+      assert.equal(callCount, 1)
+    } finally {
+      globalThis.fetch = originalFetch
+      if (originalRefreshToken === undefined) delete process.env.KIRO_REFRESH_TOKEN
+      else process.env.KIRO_REFRESH_TOKEN = originalRefreshToken
+      if (originalClientId === undefined) delete process.env.KIRO_OAUTH_CLIENT_ID
+      else process.env.KIRO_OAUTH_CLIENT_ID = originalClientId
+      if (originalClientSecret === undefined) delete process.env.KIRO_OAUTH_CLIENT_SECRET
+      else process.env.KIRO_OAUTH_CLIENT_SECRET = originalClientSecret
+    }
+  })
+
+  it('uses rotated refresh token for subsequent cache-miss refreshes', async () => {
+    const originalRefreshToken = process.env.KIRO_REFRESH_TOKEN
+    const originalClientId = process.env.KIRO_OAUTH_CLIENT_ID
+    const originalClientSecret = process.env.KIRO_OAUTH_CLIENT_SECRET
+    const originalFetch = globalThis.fetch
+    const initialToken = 'aorAAAAAG-initial-refresh-token'
+    const rotatedToken = 'aorAAAAAG-rotated-refresh-token'
+
+    process.env.KIRO_REFRESH_TOKEN = initialToken
+    delete process.env.KIRO_OAUTH_CLIENT_ID
+    delete process.env.KIRO_OAUTH_CLIENT_SECRET
+
+    let callCount = 0
+    const tokensReceived = []
+    // expiresIn: 1 puts the expiry inside the 60-second skew window so the cache immediately misses on the next call
+    globalThis.fetch = async (url, init) => {
+      callCount += 1
+      const body = JSON.parse(String(init?.body || '{}'))
+      tokensReceived.push(body.refreshToken)
+      return new Response(JSON.stringify({
+        accessToken: `oauth-access-token-${callCount}`,
+        refreshToken: rotatedToken,
+        expiresIn: 1,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+
+    try {
+      // First call: cache miss → fetch with initialToken → response includes rotatedToken
+      const tokenA = await resolveKiroOAuthAccessToken({ providers: {} })
+      assert.equal(tokenA, 'oauth-access-token-1')
+      assert.equal(tokensReceived[0], initialToken)
+      assert.equal(callCount, 1)
+
+      // Second call: cache is expired (expiresIn:1 < skew), but sourceRefreshToken matches
+      // so effectiveRefreshToken should be the rotated token, not the original
+      const tokenB = await resolveKiroOAuthAccessToken({ providers: {} })
+      assert.equal(tokenB, 'oauth-access-token-2')
+      assert.equal(tokensReceived[1], rotatedToken)
+      assert.equal(callCount, 2)
+    } finally {
+      globalThis.fetch = originalFetch
+      if (originalRefreshToken === undefined) delete process.env.KIRO_REFRESH_TOKEN
+      else process.env.KIRO_REFRESH_TOKEN = originalRefreshToken
+      if (originalClientId === undefined) delete process.env.KIRO_OAUTH_CLIENT_ID
+      else process.env.KIRO_OAUTH_CLIENT_ID = originalClientId
+      if (originalClientSecret === undefined) delete process.env.KIRO_OAUTH_CLIENT_SECRET
+      else process.env.KIRO_OAUTH_CLIENT_SECRET = originalClientSecret
+    }
+  })
+
+  it('builds Kiro browser OAuth URLs for Google and GitHub', () => {
+    const googleUrl = new URL(buildKiroSocialLoginUrl('google', 'challenge-google', 'state-google'))
+    assert.equal(`${googleUrl.origin}${googleUrl.pathname}`, 'https://prod.us-east-1.auth.desktop.kiro.dev/login')
+    assert.equal(googleUrl.searchParams.get('idp'), 'Google')
+    assert.equal(googleUrl.searchParams.get('code_challenge'), 'challenge-google')
+    assert.equal(googleUrl.searchParams.get('code_challenge_method'), 'S256')
+    assert.equal(googleUrl.searchParams.get('state'), 'state-google')
+    assert.equal(googleUrl.searchParams.get('redirect_uri'), 'kiro://kiro.kiroAgent/authenticate-success')
+
+    const githubUrl = new URL(buildKiroSocialLoginUrl('github', 'challenge-github', 'state-github'))
+    assert.equal(githubUrl.searchParams.get('idp'), 'Github')
+  })
+
+  it('exchanges Kiro browser OAuth codes for tokens', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async (url, init) => {
+      assert.equal(String(url), 'https://prod.us-east-1.auth.desktop.kiro.dev/oauth/token')
+      assert.equal(init?.method, 'POST')
+      assert.equal(init?.headers?.['Content-Type'], 'application/json')
+      const body = JSON.parse(String(init?.body || '{}'))
+      assert.equal(body.code, 'browser-code')
+      assert.equal(body.code_verifier, 'browser-verifier')
+      assert.equal(body.redirect_uri, 'kiro://kiro.kiroAgent/authenticate-success')
+      return new Response(JSON.stringify({
+        accessToken: 'access.jwt.token',
+        refreshToken: 'aorAAAAAG-browser-refresh',
+        profileArn: 'arn:aws:builder-profile',
+        expiresIn: 1800,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+
+    try {
+      const tokenData = await exchangeKiroSocialCode('browser-code', 'browser-verifier')
+      assert.deepEqual(tokenData, {
+        accessToken: 'access.jwt.token',
+        refreshToken: 'aorAAAAAG-browser-refresh',
+        profileArn: 'arn:aws:builder-profile',
+        expiresIn: 1800,
+      })
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('extracts Kiro auth email from JWT access tokens when present', () => {
+    const payload = Buffer.from(JSON.stringify({ email: 'kiro@example.com' }), 'utf8')
+      .toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/g, '')
+    const token = `header.${payload}.signature`
+    assert.equal(extractKiroEmailFromAccessToken(token), 'kiro@example.com')
+    assert.equal(extractKiroEmailFromAccessToken('not-a-jwt'), null)
+  })
+
+  it('starts Kiro AWS Builder ID device authorization', async () => {
+    const originalFetch = globalThis.fetch
+    const calls = []
+    globalThis.fetch = async (url, init) => {
+      calls.push({ url: String(url), init })
+      if (String(url) === 'https://oidc.us-east-1.amazonaws.com/client/register') {
+        return new Response(JSON.stringify({
+          clientId: 'builder-client-id',
+          clientSecret: 'builder-client-secret',
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (String(url) === 'https://oidc.us-east-1.amazonaws.com/device_authorization') {
+        const body = JSON.parse(String(init?.body || '{}'))
+        assert.equal(body.clientId, 'builder-client-id')
+        assert.equal(body.clientSecret, 'builder-client-secret')
+        assert.equal(body.startUrl, 'https://view.awsapps.com/start')
+        return new Response(JSON.stringify({
+          deviceCode: 'device-code-123',
+          userCode: 'ABCD-EFGH',
+          verificationUri: 'https://device.sso.aws/verify',
+          verificationUriComplete: 'https://device.sso.aws/verify?user_code=ABCD-EFGH',
+          expiresIn: 600,
+          interval: 5,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`)
+    }
+
+    try {
+      const auth = await startKiroBuilderIdDeviceAuth()
+      assert.deepEqual(auth, {
+        clientId: 'builder-client-id',
+        clientSecret: 'builder-client-secret',
+        deviceCode: 'device-code-123',
+        userCode: 'ABCD-EFGH',
+        verificationUri: 'https://device.sso.aws/verify',
+        verificationUriComplete: 'https://device.sso.aws/verify?user_code=ABCD-EFGH',
+        expiresIn: 600,
+        interval: 5,
+      })
+      assert.equal(calls.length, 2)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('polls Kiro AWS Builder ID tokens and surfaces pending status', async () => {
+    const originalFetch = globalThis.fetch
+
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      error: 'authorization_pending',
+      error_description: 'Still waiting for approval',
+    }), { status: 400, headers: { 'Content-Type': 'application/json' } })
+
+    try {
+      const pending = await pollKiroBuilderIdToken('device-code-123', 'builder-client-id', 'builder-client-secret')
+      assert.deepEqual(pending, {
+        success: false,
+        pending: true,
+        error: 'authorization_pending',
+        errorDescription: 'Still waiting for approval',
+      })
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('polls Kiro AWS Builder ID tokens and returns refresh credentials on success', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async (url, init) => {
+      assert.equal(String(url), 'https://oidc.us-east-1.amazonaws.com/token')
+      assert.equal(init?.method, 'POST')
+      const body = JSON.parse(String(init?.body || '{}'))
+      assert.equal(body.clientId, 'builder-client-id')
+      assert.equal(body.clientSecret, 'builder-client-secret')
+      assert.equal(body.deviceCode, 'device-code-123')
+      assert.equal(body.grantType, 'urn:ietf:params:oauth:grant-type:device_code')
+      return new Response(JSON.stringify({
+        accessToken: 'builder-access-token',
+        refreshToken: 'aorAAAAAG-builder-refresh',
+        expiresIn: 3600,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+
+    try {
+      const result = await pollKiroBuilderIdToken('device-code-123', 'builder-client-id', 'builder-client-secret')
+      assert.deepEqual(result, {
+        success: true,
+        tokens: {
+          accessToken: 'builder-access-token',
+          refreshToken: 'aorAAAAAG-builder-refresh',
+          expiresIn: 3600,
+          clientId: 'builder-client-id',
+          clientSecret: 'builder-client-secret',
+        },
+      })
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   it('treats OpenCode and KiloCode auth as optional bearer auth providers, and local Ollama as optional', () => {
     assert.equal(isProviderAuthOptional({}, 'opencode'), true)
     assert.equal(isProviderAuthOptional({}, 'kilocode'), true)
@@ -380,6 +705,119 @@ describe('provider api key resolution', () => {
     assert.equal(headers['x-opencode-session'], 'ses_test')
     assert.equal(headers['x-opencode-request'], 'req_test')
     assert.equal(headers['x-opencode-client'], 'cli')
+  })
+
+  it('adds Kiro SDK headers to provider requests', () => {
+    const headers = buildProviderRequestHeaders('kiro', {
+      apiKey: 'kiro-key',
+    })
+
+    assert.equal(headers['Content-Type'], 'application/json')
+    assert.equal(headers.Accept, 'application/vnd.amazon.eventstream')
+    assert.equal(headers.Authorization, 'Bearer kiro-key')
+    assert.equal(headers['X-Amz-Target'], 'AmazonCodeWhispererStreamingService.GenerateAssistantResponse')
+    assert.equal(headers['User-Agent'], 'AWS-SDK-JS/3.0.0 kiro-ide/1.0.0')
+    assert.equal(headers['X-Amz-User-Agent'], 'aws-sdk-js/3.0.0 kiro-ide/1.0.0')
+  })
+
+  it('translates OpenAI chat payloads into Kiro conversation state', () => {
+    const payload = buildKiroRequestPayload({
+      messages: [
+        { role: 'system', content: 'Keep it short.' },
+        { role: 'user', content: 'Say hi.' },
+      ],
+      max_tokens: 32,
+      temperature: 0.4,
+    }, 'claude-haiku-4.5')
+
+    assert.equal(payload.conversationState.chatTriggerType, 'MANUAL')
+    assert.equal(payload.conversationState.currentMessage.userInputMessage.modelId, 'claude-haiku-4.5')
+    assert.equal(payload.conversationState.currentMessage.userInputMessage.origin, 'AI_EDITOR')
+    assert.match(payload.conversationState.currentMessage.userInputMessage.content, /\[Context: Current time is .*]\n\nSay hi\./)
+    assert.equal(payload.conversationState.history.length, 1)
+    assert.equal(payload.conversationState.history[0].userInputMessage.content, 'Keep it short.')
+    assert.equal(payload.inferenceConfig.maxTokens, 32)
+    assert.equal(payload.inferenceConfig.temperature, 0.4)
+  })
+
+  it('routes provider request body translation through Kiro only', () => {
+    const kiroBody = buildProviderRequestBody('kiro', {
+      model: 'claude-haiku-4.5',
+      messages: [{ role: 'user', content: 'Hello there' }],
+    }, 'claude-haiku-4.5')
+
+    assert.ok(kiroBody.conversationState)
+    assert.equal(kiroBody.model, undefined)
+
+    const passthrough = { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'Hello' }] }
+    assert.equal(buildProviderRequestBody('openrouter', passthrough, 'gpt-4o-mini'), passthrough)
+  })
+
+  it('parses Kiro AWS EventStream frames', () => {
+    const frame = encodeKiroEventFrame('assistantResponseEvent', { content: 'hello' })
+    const parsed = parseKiroEventFrame(frame)
+
+    assert.equal(parsed.headers[':event-type'], 'assistantResponseEvent')
+    assert.equal(parsed.payload.content, 'hello')
+  })
+
+  it('transforms Kiro EventStream responses into OpenAI JSON responses', async () => {
+    const bytes = Buffer.concat([
+      Buffer.from(encodeKiroEventFrame('assistantResponseEvent', { content: 'Hello' })),
+      Buffer.from(encodeKiroEventFrame('assistantResponseEvent', { content: ' there' })),
+      Buffer.from(encodeKiroEventFrame('metricsEvent', { inputTokens: 11, outputTokens: 3 })),
+      Buffer.from(encodeKiroEventFrame('messageStopEvent', {})),
+    ])
+    const response = new Response(bytes, {
+      status: 200,
+      headers: { 'content-type': 'application/vnd.amazon.eventstream' },
+    })
+
+    const transformed = await transformKiroResponse(response, 'claude-haiku-4.5', false)
+    const data = JSON.parse(await transformed.text())
+
+    assert.equal(transformed.headers.get('content-type'), 'application/json')
+    assert.equal(data.choices[0].message.role, 'assistant')
+    assert.equal(data.choices[0].message.content, 'Hello there')
+    assert.equal(data.usage.prompt_tokens, 11)
+    assert.equal(data.usage.completion_tokens, 3)
+  })
+
+  it('assembles Kiro streaming tool call input.raw fragments into complete arguments', async () => {
+    // Kiro sends toolUseEvent multiple times for the same toolId:
+    // first with {toolUseId, name} announcing the tool, then with {toolUseId, input: {raw: "fragment"}}
+    // carrying partial JSON fragments that must be concatenated.
+    const toolId = 'tool-use-id-123'
+    const bytes = Buffer.concat([
+      Buffer.from(encodeKiroEventFrame('toolUseEvent', { toolUseId: toolId, name: 'exec', input: null })),
+      Buffer.from(encodeKiroEventFrame('toolUseEvent', { toolUseId: toolId, input: { raw: '{"command"' } })),
+      Buffer.from(encodeKiroEventFrame('toolUseEvent', { toolUseId: toolId, input: { raw: ': "echo hi"}' } })),
+      Buffer.from(encodeKiroEventFrame('metricsEvent', { inputTokens: 5, outputTokens: 2 })),
+      Buffer.from(encodeKiroEventFrame('messageStopEvent', {})),
+    ])
+    const response = new Response(bytes, {
+      status: 200,
+      headers: { 'content-type': 'application/vnd.amazon.eventstream' },
+    })
+
+    const transformed = await transformKiroResponse(response, 'claude-haiku-4.5', false)
+    const data = JSON.parse(await transformed.text())
+
+    assert.equal(data.choices[0].finish_reason, 'tool_calls')
+    assert.equal(data.choices[0].message.tool_calls.length, 1)
+    const tc = data.choices[0].message.tool_calls[0]
+    assert.equal(tc.id, toolId)
+    assert.equal(tc.function.name, 'exec')
+    assert.equal(tc.function.arguments, '{"command": "echo hi"}')
+  })
+
+  it('does not add Kiro SDK headers for non-Kiro providers', () => {
+    const headers = buildProviderRequestHeaders('openrouter', {
+      apiKey: 'openrouter-key',
+    })
+
+    assert.equal(headers['User-Agent'], undefined)
+    assert.equal(headers['X-Amz-User-Agent'], undefined)
   })
 
   it('retries optional providers with bearer auth when an unauthenticated probe is rejected', () => {

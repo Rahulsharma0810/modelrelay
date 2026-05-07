@@ -14,7 +14,7 @@
 
 ---
 
-### 🔥 100% Free • Auto-Routing • 80+ Models • 11+ Providers • OpenAI-Compatible
+### 🔥 100% Free • Auto-Routing • 80+ Models • 12+ Providers • OpenAI-Compatible
 
 **modelrelay** is an OpenAI-compatible local router that benchmarks free coding models across top providers and automatically forwards your requests to the best available model. 
 
@@ -22,7 +22,7 @@
 
 - 💸 **Completely Free:** Stop paying for API usage. We seamlessly provide access to robust free models.
 - 🧠 **State-of-the-Art (SOTA) Models:** Out-of-the-box availability for top-tier models including **Kimi K2.5, Minimax M2.5, GLM 5, Deepseek V3.2**, and more.
-- 🏢 **Reliable Providers:** We route requests securely through trusted, high-performance platforms like **NVIDIA, Groq, OpenRouter, OpenCode Zen, Ollama, and Google**.
+- 🏢 **Reliable Providers:** We route requests securely through trusted, high-performance platforms like **NVIDIA, Groq, OpenRouter, OpenCode Zen, Ollama, Kiro, and Google**.
 - ⚡ **Lightning Fast:** The built-in benchmark continually evaluates metrics to pick the fastest and most capable LLM for your request.
 - 🔄 **OpenAI-Compatible:** A perfect drop-in replacement that works seamlessly with your existing tools, scripts, and workflows.
 
@@ -220,7 +220,17 @@ Example:
   - `CODESTRAL_API_KEY`
   - `HYPERBOLIC_API_KEY`
   - `SCALEWAY_API_KEY`
+  - `KIRO_REFRESH_TOKEN`
+  - `KIRO_OAUTH_CLIENT_ID` (optional, for AWS Builder/IDC refresh flow)
+  - `KIRO_OAUTH_CLIENT_SECRET` (optional, for AWS Builder/IDC refresh flow)
   - `GOOGLE_API_KEY`
+
+Kiro OAuth notes:
+- Base endpoint is preconfigured to `https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse`
+- Current Kiro model IDs include `claude-sonnet-4.5` and `claude-haiku-4.5`
+- Authentication uses OAuth access tokens refreshed from:
+  - `KIRO_REFRESH_TOKEN`, or
+  - `~/.aws/sso/cache` (auto-detected refresh token), following OmniRoute’s approach.
 
 For hosted Ollama, set `OLLAMA_API_KEY` and optionally override `OLLAMA_BASE_URL` / `OLLAMA_MODEL`.
 If you leave the Ollama base URL blank in the UI, modelrelay defaults to `https://ollama.com/v1`.
