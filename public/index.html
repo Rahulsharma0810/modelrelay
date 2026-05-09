@@ -1569,6 +1569,30 @@
       background: var(--surface-alt);
       color: var(--text);
     }
+
+    .copy-log-btn {
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      cursor: pointer;
+      transition: background 0.15s, color 0.15s;
+    }
+
+    .copy-log-btn:hover {
+      background: var(--surface-hover);
+      color: var(--text);
+    }
+
+    .copy-log-btn.copied {
+      background: var(--status-success-bg);
+      border-color: var(--status-success-border);
+      color: var(--status-success-text);
+    }
+
     .update-badge {
       display: inline-flex;
       align-items: center;
@@ -2178,6 +2202,8 @@
     let metaLoaded = false;
     let logsViewMode = 'history';
     let logsAutoRefreshPaused = false;
+    let logsDataMap = {};
+    let historyItemsArr = [];
     const PROVIDER_ERROR_MAX_AGE_MS = 120 * 60_000;
     let filterRules = { minSweScore: null, excludedProviders: [] };
     let providerRefreshInFlight = new Set();
@@ -4470,6 +4496,7 @@
           const isBanned = logModelStatus === 'banned';
           // Use a stable unique id for toggling
           const cardId = 'log-' + l.timestamp.replace(/[^a-z0-9]/gi, '');
+          logsDataMap[cardId] = l;
           const isExpanded = expandedCards.has(cardId) ? ' expanded' : '';
           return `
             <div class="log-card${isExpanded}" id="${cardId}">
@@ -4501,7 +4528,8 @@
                 ${functionCallHtml}
                 ${failoverHtml}
                 ${errorHtml}
-                <div style="margin-top:16px; padding-top:12px; border-top:1px solid var(--border); display:flex; justify-content:flex-end;">
+                <div style="margin-top:16px; padding-top:12px; border-top:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; gap:8px;">
+                  <button class="copy-log-btn" onclick="event.stopPropagation(); copyLogToClipboard('${cardId}')">📋 Copy</button>
                   <button onclick="event.stopPropagation(); toggleBan('${l.model}', '${logModelStatus}')" style="background: ${isBanned ? 'var(--border-subtle)' : 'var(--status-error-bg)'}; border: 1px solid ${isBanned ? 'var(--border-subtle)' : 'var(--status-error-border)'}; padding: 6px 14px; border-radius: 6px; font-size: 0.75rem; font-weight: 600; color: ${isBanned ? 'var(--status-neutral-text)' : 'var(--status-error-text)'}; cursor: pointer;">${isBanned ? '✓ Unban Model' : '🚫 Ban Model'}</button>
                 </div>
               </div>
@@ -4661,7 +4689,8 @@
         return;
       }
 
-      container.innerHTML = deduped.map(item => {
+      historyItemsArr = deduped;
+      container.innerHTML = deduped.map((item, idx) => {
         const role = item.role || 'unknown';
         const date = new Date(item.timestamp);
         const timeStr = Number.isNaN(date.getTime())
@@ -4675,8 +4704,9 @@
 
         return `
           <div style="background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.02);">
-            <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
+            <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px;">
               <span style="font-size: 0.68rem; font-weight:700; letter-spacing:0.06em; text-transform:uppercase; color:${badgeColor};">${escapeHtml(role)}</span>
+              <button class="copy-log-btn history-copy-btn" data-idx="${idx}" onclick="copyHistoryItem(${idx})">📋 Copy</button>
             </div>
             <div style="font-family: monospace; font-size: 0.8rem; white-space: pre-wrap; word-break: break-word; color: var(--text); background: var(--chat-bg); padding: 9px; border-radius: 7px; border: 1px solid var(--border); max-height: 240px; overflow-y:auto;">${content}</div>
             <div style="margin-top:8px; font-size: 0.74rem; color: var(--text-muted); display:flex; gap:8px; flex-wrap:wrap;">
@@ -4694,6 +4724,78 @@
 
     function toggleLogCard(id) {
       document.getElementById(id)?.classList.toggle('expanded');
+    }
+
+    function copyLogToClipboard(cardId) {
+      const l = logsDataMap[cardId];
+      if (!l) return;
+      const date = new Date(l.timestamp);
+      const timeStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      const statusText = l.status === '200' ? '200 OK' : (l.status || 'unknown');
+      const modelLine = l.resolvedModel
+        ? `[MODEL]: ${l.model} (resolved: ${l.resolvedModel})`
+        : `[MODEL]: ${l.model}`;
+      const statusLine = l.duration != null
+        ? `[STATUS]: ${statusText} | ${l.duration}ms`
+        : `[STATUS]: ${statusText}`;
+      const lines = [
+        `[TIME]: ${timeStr}`,
+        modelLine,
+        statusLine,
+      ];
+      const messages = Array.isArray(l.messages) ? l.messages : [];
+      for (const m of messages) {
+        const role = m.role ? m.role.toUpperCase() : 'UNKNOWN';
+        const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content, null, 2);
+        lines.push(`[${role}]: ${content}`);
+      }
+      if (l.response) {
+        lines.push(`[ASSISTANT]: ${l.response}`);
+      }
+      const text = lines.join('\n');
+      navigator.clipboard.writeText(text).then(() => {
+        const btn = document.querySelector(`#${cardId} .copy-log-btn`);
+        if (btn) {
+          btn.textContent = '✓ Copied';
+          btn.classList.add('copied');
+          setTimeout(() => {
+            btn.textContent = '📋 Copy';
+            btn.classList.remove('copied');
+          }, 2000);
+        }
+      }).catch(() => {});
+    }
+
+    function copyHistoryItem(idx) {
+      const item = historyItemsArr[idx];
+      if (!item) return;
+      const date = new Date(item.timestamp);
+      const timeStr = Number.isNaN(date.getTime())
+        ? 'Unknown time'
+        : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      const modelLine = item.resolvedModel
+        ? `[MODEL]: ${item.model || '(unknown model)'} (resolved: ${item.resolvedModel})`
+        : `[MODEL]: ${item.model || '(unknown model)'}`;
+      const role = item.role ? item.role.toUpperCase() : 'UNKNOWN';
+      const content = typeof item.content === 'string'
+        ? item.content
+        : JSON.stringify(item.content, null, 2);
+      const text = [
+        `[TIME]: ${timeStr}`,
+        modelLine,
+        `[${role}]: ${content}`,
+      ].join('\n');
+      navigator.clipboard.writeText(text).then(() => {
+        const btn = document.querySelector(`.history-copy-btn[data-idx="${idx}"]`);
+        if (btn) {
+          btn.textContent = '✓ Copied';
+          btn.classList.add('copied');
+          setTimeout(() => {
+            btn.textContent = '📋 Copy';
+            btn.classList.remove('copied');
+          }, 2000);
+        }
+      }).catch(() => {});
     }
 
     function openDrawer(m) {
