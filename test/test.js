@@ -26,7 +26,7 @@ import { normalizeMissingScoreId } from '../lib/score-fetcher.js'
 import { resolveAutostartExecPath, resolveAutostartNodePath } from '../lib/autostart.js'
 import { exportConfigToken, getApiKey, getApiKeyPool, getMaxTurns, getPinningMode, getProviderBaseUrl, getProviderModelId, getProviderPingIntervalMs, hasMultipleKeys, importConfigToken, normalizeConfigShape } from '../lib/config.js'
 import { buildNpmInstallInvocation, buildWindowsPostUpdateRestartCommand, getForcedUpdateVersion, getLocalUpdateTarballPath, getLocalUpdateVersion, isRunningFromSource, shouldStopAutostartBeforeUpdate } from '../lib/update.js'
-import { buildKiroRequestPayload, buildKiroSocialLoginUrl, buildOpencodeHeaders, buildOpencodeProjectId, buildProviderRequestBody, buildProviderRequestHeaders, exchangeKiroSocialCode, extractKiroEmailFromAccessToken, extractOllamaModelRecords, getAccountStatus, getKiroRefreshToken, hasKiroAuthConfigured, getPinnedModelCandidate, getPinnedModelMatches, isProviderAuthOptional, isProviderBearerAuthEnabled, parseKiroEventFrame, pollKiroBuilderIdToken, providerWantsBearerAuth, resolveKiroOAuthAccessToken, shouldRetryOptionalProviderWithBearer, startKiroBuilderIdDeviceAuth, toOllamaModelMeta, toOpenCodeModelMeta, toOpenRouterModelMeta, toKiloCodeModelMeta, transformKiroResponse } from '../lib/server.js'
+import { buildKiroRequestPayload, buildKiroSocialLoginUrl, buildOpencodeHeaders, buildOpencodeProjectId, buildProviderRequestBody, buildProviderRequestHeaders, exchangeKiroSocialAuthFlow, exchangeKiroSocialCode, extractKiroEmailFromAccessToken, extractOllamaModelRecords, getAccountStatus, getKiroRefreshToken, hasKiroAuthConfigured, getPinnedModelCandidate, getPinnedModelMatches, isProviderAuthOptional, isProviderBearerAuthEnabled, parseKiroEventFrame, pollKiroBuilderIdToken, providerWantsBearerAuth, resolveKiroOAuthAccessToken, shouldRetryOptionalProviderWithBearer, startKiroBuilderIdDeviceAuth, startKiroSocialAuthFlow, toOllamaModelMeta, toOpenCodeModelMeta, toOpenRouterModelMeta, toKiloCodeModelMeta, transformKiroResponse } from '../lib/server.js'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(__dirname, '..')
 
@@ -80,11 +80,13 @@ function crc32(buf) {
   return (crc ^ 0xffffffff) >>> 0
 }
 
-function encodeKiroEventFrame(eventType, payload) {
+function encodeKiroFrame(headers, payload) {
   const encoder = new TextEncoder()
-  const nameBytes = encoder.encode(':event-type')
-  const valueBytes = encoder.encode(eventType)
-  const headersLength = 1 + nameBytes.length + 1 + 2 + valueBytes.length
+  const encodedHeaders = Object.entries(headers).map(([name, value]) => ({
+    nameBytes: encoder.encode(name),
+    valueBytes: encoder.encode(String(value)),
+  }))
+  const headersLength = encodedHeaders.reduce((sum, header) => sum + 1 + header.nameBytes.length + 1 + 2 + header.valueBytes.length, 0)
   const payloadBytes = encoder.encode(payload == null ? '' : JSON.stringify(payload))
   const totalLength = 12 + headersLength + payloadBytes.length + 4
   const frame = new Uint8Array(totalLength)
@@ -95,21 +97,27 @@ function encodeKiroEventFrame(eventType, payload) {
   view.setUint32(8, crc32(frame.slice(0, 8)), false)
 
   let offset = 12
-  frame[offset] = nameBytes.length
-  offset += 1
-  frame.set(nameBytes, offset)
-  offset += nameBytes.length
-  frame[offset] = 7
-  offset += 1
-  frame[offset] = (valueBytes.length >> 8) & 0xff
-  frame[offset + 1] = valueBytes.length & 0xff
-  offset += 2
-  frame.set(valueBytes, offset)
-  offset += valueBytes.length
+  for (const { nameBytes, valueBytes } of encodedHeaders) {
+    frame[offset] = nameBytes.length
+    offset += 1
+    frame.set(nameBytes, offset)
+    offset += nameBytes.length
+    frame[offset] = 7
+    offset += 1
+    frame[offset] = (valueBytes.length >> 8) & 0xff
+    frame[offset + 1] = valueBytes.length & 0xff
+    offset += 2
+    frame.set(valueBytes, offset)
+    offset += valueBytes.length
+  }
   frame.set(payloadBytes, offset)
 
   view.setUint32(totalLength - 4, crc32(frame.slice(0, totalLength - 4)), false)
   return frame
+}
+
+function encodeKiroEventFrame(eventType, payload) {
+  return encodeKiroFrame({ ':event-type': eventType }, payload)
 }
 
 describe('config helpers', () => {
@@ -540,6 +548,39 @@ describe('provider api key resolution', () => {
     }
   })
 
+  it('keeps Kiro browser OAuth PKCE verifier server-side during exchange', async () => {
+    const flow = startKiroSocialAuthFlow('google')
+    assert.match(flow.flowId, /^[0-9a-f-]{36}$/)
+    assert.equal(flow.codeVerifier, undefined)
+    assert.equal(flow.authUrl.includes('code_challenge='), true)
+    const state = new URL(flow.authUrl).searchParams.get('state')
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async (url, init) => {
+      assert.equal(String(url), 'https://prod.us-east-1.auth.desktop.kiro.dev/oauth/token')
+      const body = JSON.parse(String(init?.body || '{}'))
+      assert.equal(body.code, 'browser-code')
+      assert.match(body.code_verifier, /^[A-Fa-f0-9]{64}$/)
+      assert.notEqual(body.code_verifier, 'attacker-controlled-verifier')
+      return new Response(JSON.stringify({
+        accessToken: 'access.jwt.token',
+        refreshToken: 'aorAAAAAG-flow-refresh',
+        expiresIn: 1800,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+
+    try {
+      const tokenData = await exchangeKiroSocialAuthFlow(flow.flowId, 'browser-code', state)
+      assert.equal(tokenData.refreshToken, 'aorAAAAAG-flow-refresh')
+      await assert.rejects(
+        () => exchangeKiroSocialAuthFlow(flow.flowId, 'browser-code', state),
+        /Unknown or expired Kiro browser OAuth flow/
+      )
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   it('extracts Kiro auth email from JWT access tokens when present', () => {
     const payload = Buffer.from(JSON.stringify({ email: 'kiro@example.com' }), 'utf8')
       .toString('base64')
@@ -781,6 +822,25 @@ describe('provider api key resolution', () => {
     assert.equal(data.choices[0].message.content, 'Hello there')
     assert.equal(data.usage.prompt_tokens, 11)
     assert.equal(data.usage.completion_tokens, 3)
+  })
+
+  it('transforms Kiro EventStream exception frames into OpenAI error responses', async () => {
+    const bytes = Buffer.from(encodeKiroFrame({
+      ':message-type': 'exception',
+      ':exception-type': 'ThrottlingException',
+    }, { message: 'Rate exceeded' }))
+    const response = new Response(bytes, {
+      status: 200,
+      headers: { 'content-type': 'application/vnd.amazon.eventstream' },
+    })
+
+    const transformed = await transformKiroResponse(response, 'claude-haiku-4.5', false)
+    const data = JSON.parse(await transformed.text())
+
+    assert.equal(transformed.status, 502)
+    assert.equal(data.error.message, 'Rate exceeded')
+    assert.equal(data.error.type, 'kiro_error')
+    assert.equal(data.error.code, 'ThrottlingException')
   })
 
   it('assembles Kiro streaming tool call input.raw fragments into complete arguments', async () => {

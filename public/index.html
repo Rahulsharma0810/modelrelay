@@ -4347,7 +4347,7 @@
         kiroBrowserAuthState = {
           provider,
           authUrl: data.authUrl,
-          codeVerifier: data.codeVerifier,
+          flowId: data.flowId,
           state: data.state,
         };
         await loadSettings();
@@ -4414,7 +4414,8 @@
           body: JSON.stringify({
             provider: kiroBrowserAuthState.provider,
             code,
-            codeVerifier: kiroBrowserAuthState.codeVerifier,
+            flowId: kiroBrowserAuthState.flowId,
+            state,
           })
         });
         const data = await res.json().catch(() => ({}));
