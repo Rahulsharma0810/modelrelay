@@ -1076,6 +1076,22 @@ describe('dynamic model score resolution', () => {
     assert.equal(gemma.isEstimatedScore, false)
   })
 
+  it('uses researched score entries for newly discovered OpenRouter free coding models', () => {
+    const cases = [
+      ['baidu/cobuddy:free', 0.715],
+      ['deepseek-v4-flash-free', 0.79],
+      ['inclusionai/ring-2.6-1t:free', 0.727],
+      ['nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free', 0.744],
+      ['poolside/laguna-m.1:free', 0.725],
+      ['poolside/laguna-xs.2:free', 0.682],
+      ['ring-2.6-1t-free', 0.727],
+    ]
+
+    for (const [modelId, expectedScore] of cases) {
+      assert.equal(getScore(modelId), expectedScore)
+    }
+  })
+
   it('ignores safety-only dynamic models that should not be routed as coding models', () => {
     assert.equal(toKiloCodeModelMeta({ id: 'meta-llama/llama-guard-4-12b:free' }), null)
     assert.equal(toOpenRouterModelMeta({ id: 'meta-llama/llama-guard-4-12b:free' }), null)
