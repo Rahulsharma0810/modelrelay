@@ -27,7 +27,7 @@ import { normalizeMissingScoreId } from '../lib/score-fetcher.js'
 import { resolveAutostartExecPath, resolveAutostartNodePath } from '../lib/autostart.js'
 import { exportConfigToken, getApiKey, getApiKeyPool, getMaxTurns, getPinningMode, getProviderBaseUrl, getProviderModelId, getProviderPingIntervalMs, hasMultipleKeys, importConfigToken, normalizeConfigShape, isOpenAICompatibleInstanceKey, getBaseProviderKey, getOpenAICompatibleInstanceId, buildOpenAICompatibleInstanceKey, listOpenAICompatibleEndpoints, upsertOpenAICompatibleEndpoint, removeOpenAICompatibleEndpoint } from '../lib/config.js'
 import { buildNpmInstallInvocation, buildWindowsPostUpdateRestartCommand, getForcedUpdateVersion, getLocalUpdateTarballPath, getLocalUpdateVersion, isRunningFromSource, shouldStopAutostartBeforeUpdate } from '../lib/update.js'
-import { buildKiroRequestPayload, buildKiroSocialLoginUrl, buildOpencodeHeaders, buildOpencodeProjectId, buildProviderRequestBody, buildProviderRequestHeaders, exchangeKiroSocialAuthFlow, exchangeKiroSocialCode, extractKiroEmailFromAccessToken, extractOllamaModelRecords, extractOpenAICompatibleModelRecords, buildOpenAICompatibleModelsListUrl, getAccountStatus, getKiroRefreshToken, hasKiroAuthConfigured, getPinnedModelCandidate, getPinnedModelMatches, isProviderAuthOptional, isProviderBearerAuthEnabled, parseKiroEventFrame, pollKiroBuilderIdToken, providerWantsBearerAuth, resolveKiroOAuthAccessToken, shouldRetryOptionalProviderWithBearer, startKiroBuilderIdDeviceAuth, startKiroSocialAuthFlow, toOllamaModelMeta, toOpenAICompatibleDiscoveredModelMeta, toOpenCodeModelMeta, toOpenRouterModelMeta, toKiloCodeModelMeta, transformKiroResponse } from '../lib/server.js'
+import { buildKiroRequestPayload, buildKiroSocialLoginUrl, buildOpencodeHeaders, buildOpencodeProjectId, buildProviderRequestBody, buildProviderRequestHeaders, exchangeKiroSocialAuthFlow, exchangeKiroSocialCode, extractKiroEmailFromAccessToken, extractOllamaModelRecords, extractOpenAICompatibleModelRecords, buildOpenAICompatibleModelsListUrl, getAccountStatus, getKiroRefreshToken, hasKiroAuthConfigured, getPinnedModelCandidate, getPinnedModelMatches, isProviderAuthOptional, isProviderBearerAuthEnabled, parseKiroEventFrame, pollKiroBuilderIdToken, providerWantsBearerAuth, resolveKiroOAuthAccessToken, shouldRetryOptionalProviderWithBearer, startKiroBuilderIdDeviceAuth, startKiroSocialAuthFlow, toOllamaModelMeta, toOpenAICompatibleDiscoveredModelMeta, toOpenCodeModelMeta, toOpenRouterModelMeta, toKiloCodeModelMeta, transformKiroResponse, extractAiHubMixModelRecords, toAiHubMixModelMeta } from '../lib/server.js'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(__dirname, '..')
 
@@ -198,6 +198,13 @@ describe('sources data integrity', () => {
     assert.ok(sources.kiro)
     assert.equal(sources.kiro.name, 'Kiro')
     assert.ok(Array.isArray(sources.kiro.models))
+  })
+
+  it('includes AiHubMix provider', () => {
+    assert.ok(sources.aihubmix)
+    assert.equal(sources.aihubmix.name, 'AiHubMix')
+    assert.equal(sources.aihubmix.url, 'https://aihubmix.com/v1/chat/completions')
+    assert.ok(Array.isArray(sources.aihubmix.models))
   })
 
   it('has expected provider structure', () => {
@@ -1198,6 +1205,45 @@ describe('dynamic model score resolution', () => {
     assert.deepEqual(canonicalizeModelId('gpt-oss:120b'), { base: 'openai/gpt-oss-120b', unprefixed: 'gpt-oss-120b' })
     assert.deepEqual(canonicalizeModelId('Minimax-m2.7:cloud'), { base: 'minimax-m2.7', unprefixed: 'minimax-m2.7' })
     assert.deepEqual(canonicalizeModelId('x-ai/grok-code-fast-1:optimized:free'), { base: 'x-ai/grok-code-fast-1', unprefixed: 'grok-code-fast-1' })
+  })
+})
+
+describe('AiHubMix model discovery', () => {
+  it('extracts AiHubMix model records from payloads', () => {
+    const payload = {
+      data: [
+        { id: 'gpt-4o-free' },
+        { id: 'claude-3-sonnet-free' },
+      ],
+    }
+    assert.deepEqual(extractAiHubMixModelRecords(payload), payload.data)
+    assert.deepEqual(extractAiHubMixModelRecords(null), [])
+  })
+
+  it('includes AiHubMix free models that end with -free', () => {
+    const gpt = toAiHubMixModelMeta({ id: 'gpt-4o-free' })
+    const claude = toAiHubMixModelMeta({ id: 'claude-3-sonnet-free' })
+
+    assert.ok(gpt)
+    assert.equal(gpt.modelId, 'gpt-4o-free')
+    assert.equal(gpt.providerKey, 'aihubmix')
+
+    assert.ok(claude)
+    assert.equal(claude.modelId, 'claude-3-sonnet-free')
+    assert.equal(claude.providerKey, 'aihubmix')
+  })
+
+  it('ignores AiHubMix models that are not free (no -free suffix)', () => {
+    assert.equal(toAiHubMixModelMeta({ id: 'gpt-4o' }), null)
+    assert.equal(toAiHubMixModelMeta({ id: 'claude-3-sonnet' }), null)
+  })
+
+  it('uses scores.js entry for AiHubMix models when available', () => {
+    const model = toAiHubMixModelMeta({ id: 'minimax-m2.5-free' })
+    assert.ok(model)
+    assert.equal(model.label, 'Minimax M2.5')
+    assert.equal(model.intell, 0.802)
+    assert.equal(model.isEstimatedScore, false)
   })
 })
 

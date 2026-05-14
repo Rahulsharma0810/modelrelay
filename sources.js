@@ -27,8 +27,11 @@ export const MODEL_ID_ALIASES = {
   'kimi-k2.5': 'moonshotai/kimi-k2.5',
   'kimi-k2.6': 'moonshotai/kimi-k2.6',
   'kimi-k2:1t': 'moonshotai/kimi-k2-instruct',
+  'deepseek-v4-flash-free': 'deepseek-v4-flash',
+  'inclusionai/ring-2.6-1t:free': 'inclusionai/ring-2.6-1t',
   'inclusionai/ling-2.6-flash:free': 'inclusionai/ling-2.6-flash',
   'ling-2.6-flash-free': 'inclusionai/ling-2.6-flash',
+  'ring-2.6-1t-free': 'inclusionai/ring-2.6-1t',
   'mimo-v2-flash-free': 'mimo-v2-flash-free',
   'mimo-v2-pro-free': 'xiaomi/mimo-v2-pro',
   'qwen3:4b': 'qwen/qwen3-4b',
@@ -325,6 +328,11 @@ export const sources = {
       ["gemma-3-12b-it", "Gemma 3 12B", "128k"],
       ["gemma-3-4b-it", "Gemma 3 4B", "128k"]
     ]
+  },
+  "aihubmix": {
+    "name": "AiHubMix",
+    "url": "https://aihubmix.com/v1/chat/completions",
+    "models": []
   }
 }
 
